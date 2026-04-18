@@ -10,6 +10,17 @@ It automatically clicks `Retry` when Antigravity shows the exact failure popup t
 
 The goal is simple: remove the need for someone to sit in front of the screen waiting to manually click `Retry` when this known dialog appears.
 
+## Search Terms
+
+If you found this repository by searching for any of the terms below, you are in the right place:
+
+- `error antigravity 503`
+- `antigravity error 503`
+- `antigravity 503 error`
+- `error antigravity 500`
+- `antigravity error 500`
+- `agent terminated due to error antigravity`
+
 ## Why This Project Exists
 
 Some Antigravity workflows can stall on a recoverable error dialog that still requires a manual retry click.
