@@ -1,0 +1,14 @@
+{
+  "TaskName": "AG Auto Retry",
+  "LogPath": "C:\\ProgramData\\AGAutoRetry\\ag-auto-retry.log",
+  "PollIntervalMilliseconds": 1000,
+  "CooldownSeconds": 10,
+  "MaxRetriesPerRun": 1000,
+  "RequiredMarkerText": "Agent terminated due to error",
+  "RequiredCompanionButtonText": "Copy debug info",
+  "RetryButtonText": "Retry",
+  "TargetProcessNames": [
+    "Antigravity"
+  ],
+  "HarnessWindowTitle": "AG Auto Retry Harness"
+}
