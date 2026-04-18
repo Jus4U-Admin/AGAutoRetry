@@ -14,11 +14,20 @@ The goal is simple: remove the need for someone to sit in front of the screen wa
 
 If you found this repository by searching for any of the terms below, you are in the right place:
 
+- `Agent terminated due to error + Retry - errors 500, 503, 429 e 504`
+- `Agent terminated due to error Retry 500`
+- `Agent terminated due to error Retry 503`
+- `Agent terminated due to error Retry 429`
+- `Agent terminated due to error Retry 504`
 - `error antigravity 503`
 - `antigravity error 503`
 - `antigravity 503 error`
 - `error antigravity 500`
 - `antigravity error 500`
+- `error antigravity 429`
+- `antigravity error 429`
+- `error antigravity 504`
+- `antigravity error 504`
 - `agent terminated due to error antigravity`
 
 ## Why This Project Exists
