@@ -16,18 +16,50 @@ if ([string]::IsNullOrWhiteSpace($ConfigPath)) {
     $ConfigPath = Join-Path $script:ScriptRoot 'config.json'
 }
 
+function Initialize-NativeMethods {
+    if (-not ('AGAutoRetry.NativeMethods' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+
+namespace AGAutoRetry
+{
+    public static class NativeMethods
+    {
+        [DllImport("kernel32.dll")]
+        public static extern IntPtr GetConsoleWindow();
+
+        [DllImport("user32.dll")]
+        public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+
+        [DllImport("user32.dll")]
+        public static extern IntPtr GetForegroundWindow();
+
+        [DllImport("user32.dll")]
+        public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out int lpdwProcessId);
+
+        [DllImport("user32.dll")]
+        public static extern bool SetForegroundWindow(IntPtr hWnd);
+
+        [DllImport("user32.dll")]
+        public static extern bool ShowWindowAsync(IntPtr hWnd, int nCmdShow);
+
+        [DllImport("user32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool IsWindow(IntPtr hWnd);
+
+        [DllImport("user32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool IsWindowVisible(IntPtr hWnd);
+    }
+}
+'@
+    }
+}
+
 function Hide-ConsoleWindow {
     try {
-        if (-not ('AGAutoRetry.NativeMethods' -as [type])) {
-            Add-Type -Namespace AGAutoRetry -Name NativeMethods -MemberDefinition @'
-[DllImport("kernel32.dll")]
-public static extern IntPtr GetConsoleWindow();
-
-[DllImport("user32.dll")]
-public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
-'@ -UsingNamespace System, System.Runtime.InteropServices
-        }
-
+        Initialize-NativeMethods
         $consoleHandle = [AGAutoRetry.NativeMethods]::GetConsoleWindow()
         if ($consoleHandle -ne [IntPtr]::Zero) {
             [AGAutoRetry.NativeMethods]::ShowWindow($consoleHandle, 0) | Out-Null
@@ -49,6 +81,8 @@ function Get-DefaultConfig {
         RetryButtonText             = 'Retry'
         TargetProcessNames          = @('Antigravity')
         HarnessWindowTitle          = 'AG Auto Retry Harness'
+        RestorePreviousFocusAfterRetry = $true
+        FocusRestoreDelayMilliseconds  = 250
     }
 }
 
@@ -287,6 +321,159 @@ function Get-ProcessNameById {
     }
 }
 
+function Format-WindowHandle {
+    param([IntPtr]$Handle)
+
+    if ($Handle -eq [IntPtr]::Zero) {
+        return '0x0'
+    }
+
+    return ('0x{0}' -f $Handle.ToInt64().ToString('X'))
+}
+
+function Get-WindowProcessId {
+    param([IntPtr]$Handle)
+
+    if ($Handle -eq [IntPtr]::Zero) {
+        return $null
+    }
+
+    $processId = 0
+    [AGAutoRetry.NativeMethods]::GetWindowThreadProcessId($Handle, [ref]$processId) | Out-Null
+    if ($processId -le 0) {
+        return $null
+    }
+
+    return $processId
+}
+
+function Get-WindowTitleFromHandle {
+    param([IntPtr]$Handle)
+
+    if ($Handle -eq [IntPtr]::Zero) {
+        return ''
+    }
+
+    try {
+        $element = [System.Windows.Automation.AutomationElement]::FromHandle($Handle)
+        if ($null -ne $element) {
+            return $element.Current.Name
+        }
+    }
+    catch {
+    }
+
+    return ''
+}
+
+function Update-LastExternalForegroundWindow {
+    param([int[]]$ExcludedProcessIds)
+
+    if (-not [bool]$script:Config.RestorePreviousFocusAfterRetry) {
+        return
+    }
+
+    $foregroundHandle = [AGAutoRetry.NativeMethods]::GetForegroundWindow()
+    if ($foregroundHandle -eq [IntPtr]::Zero) {
+        return
+    }
+
+    if (-not [AGAutoRetry.NativeMethods]::IsWindow($foregroundHandle)) {
+        return
+    }
+
+    $foregroundProcessId = Get-WindowProcessId -Handle $foregroundHandle
+    if ($null -eq $foregroundProcessId -or $foregroundProcessId -le 0) {
+        return
+    }
+
+    if ($foregroundProcessId -eq $PID) {
+        return
+    }
+
+    if ($ExcludedProcessIds -contains $foregroundProcessId) {
+        return
+    }
+
+    $script:LastExternalForegroundWindow = $foregroundHandle
+    $script:LastExternalForegroundProcessId = $foregroundProcessId
+    $script:LastExternalForegroundWindowTitle = Get-WindowTitleFromHandle -Handle $foregroundHandle
+}
+
+function Restore-LastExternalForegroundWindow {
+    param([int]$TargetProcessId)
+
+    if (-not [bool]$script:Config.RestorePreviousFocusAfterRetry) {
+        return $false
+    }
+
+    $handle = $script:LastExternalForegroundWindow
+    if ($handle -eq [IntPtr]::Zero) {
+        Write-Log -Level 'WARN' -Message 'Retry clicked, but no previous foreground window was captured for focus restore.'
+        return $false
+    }
+
+    if (-not [AGAutoRetry.NativeMethods]::IsWindow($handle)) {
+        Write-Log -Level 'WARN' -Message ('Retry clicked, but the saved foreground window is no longer valid. windowHandle={0}' -f (Format-WindowHandle -Handle $handle))
+        return $false
+    }
+
+    $savedProcessId = Get-WindowProcessId -Handle $handle
+    if ($null -eq $savedProcessId -or $savedProcessId -le 0) {
+        Write-Log -Level 'WARN' -Message ('Retry clicked, but the saved foreground window no longer has a resolvable process. windowHandle={0}' -f (Format-WindowHandle -Handle $handle))
+        return $false
+    }
+
+    if (($savedProcessId -eq $TargetProcessId) -or ($savedProcessId -eq $PID)) {
+        return $false
+    }
+
+    $windowTitle = $script:LastExternalForegroundWindowTitle
+    if ([string]::IsNullOrWhiteSpace($windowTitle)) {
+        $windowTitle = Get-WindowTitleFromHandle -Handle $handle
+    }
+
+    $delayMs = [int]$script:Config.FocusRestoreDelayMilliseconds
+    if ($delayMs -gt 0) {
+        Start-Sleep -Milliseconds $delayMs
+    }
+
+    [AGAutoRetry.NativeMethods]::ShowWindowAsync($handle, 9) | Out-Null
+    [void][AGAutoRetry.NativeMethods]::SetForegroundWindow($handle)
+
+    $foregroundAfter = [AGAutoRetry.NativeMethods]::GetForegroundWindow()
+    if ($foregroundAfter -ne $handle) {
+        try {
+            $element = [System.Windows.Automation.AutomationElement]::FromHandle($handle)
+            if ($null -ne $element) {
+                $element.SetFocus()
+            }
+        }
+        catch {
+        }
+    }
+    if ($foregroundAfter -ne $handle) {
+        try {
+            $shell = New-Object -ComObject WScript.Shell
+            $activated = $shell.AppActivate($savedProcessId)
+            if ((-not $activated) -and (-not [string]::IsNullOrWhiteSpace($windowTitle))) {
+                $activated = $shell.AppActivate($windowTitle)
+            }
+        }
+        catch {
+        }
+    }
+
+    $foregroundAfter = [AGAutoRetry.NativeMethods]::GetForegroundWindow()
+    if ($foregroundAfter -eq $handle) {
+        Write-Log -Message ('Focus restored after Retry. pid={0}; windowHandle={1}; window="{2}"' -f $savedProcessId, (Format-WindowHandle -Handle $handle), $windowTitle)
+        return $true
+    }
+
+    Write-Log -Level 'WARN' -Message ('Retry clicked, but focus restore did not succeed. pid={0}; windowHandle={1}; window="{2}"' -f $savedProcessId, (Format-WindowHandle -Handle $handle), $windowTitle)
+    return $false
+}
+
 function Invoke-Retry {
     param([System.Windows.Automation.AutomationElement]$RetryButton)
 
@@ -309,11 +496,15 @@ $script:HasMutex = $false
 $script:RetryCount = 0
 $script:Config = $null
 $script:LogPath = Join-Path $script:ScriptRoot 'ag-auto-retry.log'
+$script:LastExternalForegroundWindow = [IntPtr]::Zero
+$script:LastExternalForegroundProcessId = $null
+$script:LastExternalForegroundWindowTitle = ''
 
 try {
     Hide-ConsoleWindow
     Initialize-Configuration
     Import-UiAutomationAssemblies
+    Initialize-NativeMethods
 
     $script:Mutex = New-Object System.Threading.Mutex($false, 'Local\AGAutoRetryWatcher')
     try {
@@ -339,10 +530,24 @@ try {
             if ($Mode -eq 'Production') {
                 $processIds = @(Get-TargetProcessIds -CurrentMode $Mode)
                 $windows = @(Get-TopLevelWindowsForProcessIds -ProcessIds $processIds)
+                $excludedProcessIds = $processIds
             }
             else {
                 $windows = @(Get-TestHarnessWindows)
+                $excludedProcessIds = @(
+                    $windows |
+                    ForEach-Object {
+                        try {
+                            $_.Current.ProcessId
+                        }
+                        catch {
+                        }
+                    } |
+                    Sort-Object -Unique
+                )
             }
+
+            Update-LastExternalForegroundWindow -ExcludedProcessIds $excludedProcessIds
 
             foreach ($window in $windows) {
                 $popup = Find-MatchingPopupInWindow -Window $window
@@ -362,6 +567,7 @@ try {
 
                 $script:RetryCount++
                 Write-Log -Message ('Retry clicked. pid={0}; process={1}; window="{2}"; retryCount={3}' -f $processId, $processName, $windowName, $script:RetryCount)
+                [void](Restore-LastExternalForegroundWindow -TargetProcessId $processId)
 
                 if ($ExitAfterFirstRetry) {
                     Write-Log -Message 'ExitAfterFirstRetry enabled. Watcher will stop now.'

@@ -52,6 +52,7 @@ If the popup does not match, it does nothing.
 - Scheduled Task startup at logon
 - Keepalive trigger for self-recovery
 - Single-instance protection
+- Best-effort focus return to the previous app after `Retry`
 - Cooldown between retry attempts
 - Safety cap on retries per execution
 - Controlled local test harness
@@ -139,6 +140,7 @@ Once installed:
 - the watcher starts at logon
 - it stays hidden
 - it writes logs to `C:\ProgramData\AGAutoRetry\ag-auto-retry.log`
+- after clicking `Retry`, it can attempt to restore focus to the app that was active before the Antigravity popup took focus
 - if the process is closed by mistake, the keepalive trigger relaunches it automatically
 
 ## Status and Diagnostics
