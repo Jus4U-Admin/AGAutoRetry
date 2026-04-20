@@ -59,6 +59,9 @@ namespace AGAutoRetry
         [DllImport("user32.dll")]
         [return: MarshalAs(UnmanagedType.Bool)]
         public static extern bool IsZoomed(IntPtr hWnd);
+
+        [DllImport("user32.dll")]
+        public static extern IntPtr GetAncestor(IntPtr hWnd, uint gaFlags);
     }
 }
 '@
@@ -339,12 +342,48 @@ function Format-WindowHandle {
     return ('0x{0}' -f $Handle.ToInt64().ToString('X'))
 }
 
+function Get-AutomationElementWindowHandle {
+    param([System.Windows.Automation.AutomationElement]$Element)
+
+    if ($null -eq $Element) {
+        return [IntPtr]::Zero
+    }
+
+    try {
+        return [IntPtr]::new([int64]$Element.Current.NativeWindowHandle)
+    }
+    catch {
+        return [IntPtr]::Zero
+    }
+}
+
+function Get-TopLevelWindowHandle {
+    param([IntPtr]$Handle)
+
+    if ($Handle -eq [IntPtr]::Zero) {
+        return [IntPtr]::Zero
+    }
+
+    try {
+        $topLevelHandle = [AGAutoRetry.NativeMethods]::GetAncestor($Handle, 2)
+        if ($topLevelHandle -ne [IntPtr]::Zero) {
+            return $topLevelHandle
+        }
+    }
+    catch {
+    }
+
+    return $Handle
+}
+
 function Get-WindowProcessId {
     param([IntPtr]$Handle)
 
     if ($Handle -eq [IntPtr]::Zero) {
         return $null
     }
+
+    $Handle = Get-TopLevelWindowHandle -Handle $Handle
 
     $processId = 0
     [AGAutoRetry.NativeMethods]::GetWindowThreadProcessId($Handle, [ref]$processId) | Out-Null
@@ -362,6 +401,8 @@ function Get-WindowTitleFromHandle {
         return ''
     }
 
+    $Handle = Get-TopLevelWindowHandle -Handle $Handle
+
     try {
         $element = [System.Windows.Automation.AutomationElement]::FromHandle($Handle)
         if ($null -ne $element) {
@@ -372,6 +413,12 @@ function Get-WindowTitleFromHandle {
     }
 
     return ''
+}
+
+function Clear-PendingFocusRestore {
+    $script:PendingFocusRestoreWindow = [IntPtr]::Zero
+    $script:PendingFocusRestoreProcessId = $null
+    $script:PendingFocusRestoreWindowTitle = ''
 }
 
 function Update-LastExternalForegroundWindow {
@@ -385,6 +432,8 @@ function Update-LastExternalForegroundWindow {
     if ($foregroundHandle -eq [IntPtr]::Zero) {
         return
     }
+
+    $foregroundHandle = Get-TopLevelWindowHandle -Handle $foregroundHandle
 
     if (-not [AGAutoRetry.NativeMethods]::IsWindow($foregroundHandle)) {
         return
@@ -408,16 +457,92 @@ function Update-LastExternalForegroundWindow {
     $script:LastExternalForegroundWindowTitle = Get-WindowTitleFromHandle -Handle $foregroundHandle
 }
 
-function Restore-LastExternalForegroundWindow {
+function Update-PendingFocusRestoreCandidate {
+    param(
+        [System.Windows.Automation.AutomationElement[]]$TargetWindows,
+        [IntPtr]$ForegroundHandle,
+        [int[]]$TargetProcessIds
+    )
+
+    if (-not [bool]$script:Config.RestorePreviousFocusAfterRetry) {
+        Clear-PendingFocusRestore
+        return
+    }
+
+    $ForegroundHandle = Get-TopLevelWindowHandle -Handle $ForegroundHandle
+
+    $foregroundProcessId = Get-WindowProcessId -Handle $ForegroundHandle
+    if ($null -eq $foregroundProcessId -or $foregroundProcessId -le 0) {
+        Clear-PendingFocusRestore
+        return
+    }
+
+    if (-not ($TargetProcessIds -contains $foregroundProcessId)) {
+        Clear-PendingFocusRestore
+        return
+    }
+
+    $foregroundWindow = $null
+    foreach ($window in $TargetWindows) {
+        if ((Get-AutomationElementWindowHandle -Element $window) -eq $ForegroundHandle) {
+            $foregroundWindow = $window
+            break
+        }
+    }
+
+    if ($null -eq $foregroundWindow) {
+        Clear-PendingFocusRestore
+        return
+    }
+
+    $popup = Find-MatchingPopupInWindow -Window $foregroundWindow
+    if ($null -eq $popup) {
+        # If Antigravity reached the foreground without the exact Retry popup already present,
+        # assume the user intentionally focused it and do not restore an older external window later.
+        Clear-PendingFocusRestore
+        return
+    }
+
+    $externalHandle = $script:LastExternalForegroundWindow
+    if ($externalHandle -eq [IntPtr]::Zero) {
+        Clear-PendingFocusRestore
+        return
+    }
+
+    if (-not [AGAutoRetry.NativeMethods]::IsWindow($externalHandle)) {
+        Clear-PendingFocusRestore
+        return
+    }
+
+    $externalProcessId = Get-WindowProcessId -Handle $externalHandle
+    if ($null -eq $externalProcessId -or $externalProcessId -le 0) {
+        Clear-PendingFocusRestore
+        return
+    }
+
+    if (($externalProcessId -eq $foregroundProcessId) -or ($externalProcessId -eq $PID)) {
+        Clear-PendingFocusRestore
+        return
+    }
+
+    $script:PendingFocusRestoreWindow = $externalHandle
+    $script:PendingFocusRestoreProcessId = $externalProcessId
+    $script:PendingFocusRestoreWindowTitle = $script:LastExternalForegroundWindowTitle
+}
+
+function Restore-PendingFocusWindow {
     param([int]$TargetProcessId)
 
     if (-not [bool]$script:Config.RestorePreviousFocusAfterRetry) {
         return $false
     }
 
-    $handle = $script:LastExternalForegroundWindow
+    $handle = $script:PendingFocusRestoreWindow
+    $savedProcessId = $script:PendingFocusRestoreProcessId
+    $windowTitle = $script:PendingFocusRestoreWindowTitle
+    Clear-PendingFocusRestore
+
     if ($handle -eq [IntPtr]::Zero) {
-        Write-Log -Level 'WARN' -Message 'Retry clicked, but no previous foreground window was captured for focus restore.'
         return $false
     }
 
@@ -426,7 +551,10 @@ function Restore-LastExternalForegroundWindow {
         return $false
     }
 
-    $savedProcessId = Get-WindowProcessId -Handle $handle
+    if ($null -eq $savedProcessId -or $savedProcessId -le 0) {
+        $savedProcessId = Get-WindowProcessId -Handle $handle
+    }
+
     if ($null -eq $savedProcessId -or $savedProcessId -le 0) {
         Write-Log -Level 'WARN' -Message ('Retry clicked, but the saved foreground window no longer has a resolvable process. windowHandle={0}' -f (Format-WindowHandle -Handle $handle))
         return $false
@@ -436,7 +564,6 @@ function Restore-LastExternalForegroundWindow {
         return $false
     }
 
-    $windowTitle = $script:LastExternalForegroundWindowTitle
     if ([string]::IsNullOrWhiteSpace($windowTitle)) {
         $windowTitle = Get-WindowTitleFromHandle -Handle $handle
     }
@@ -518,6 +645,10 @@ $script:LogPath = Join-Path $script:ScriptRoot 'ag-auto-retry.log'
 $script:LastExternalForegroundWindow = [IntPtr]::Zero
 $script:LastExternalForegroundProcessId = $null
 $script:LastExternalForegroundWindowTitle = ''
+$script:PendingFocusRestoreWindow = [IntPtr]::Zero
+$script:PendingFocusRestoreProcessId = $null
+$script:PendingFocusRestoreWindowTitle = ''
+$script:LastForegroundWindow = [IntPtr]::Zero
 
 try {
     Hide-ConsoleWindow
@@ -568,6 +699,12 @@ try {
 
             Update-LastExternalForegroundWindow -ExcludedProcessIds $excludedProcessIds
 
+            $foregroundHandle = Get-TopLevelWindowHandle -Handle ([AGAutoRetry.NativeMethods]::GetForegroundWindow())
+            if ($foregroundHandle -ne $script:LastForegroundWindow) {
+                Update-PendingFocusRestoreCandidate -TargetWindows $windows -ForegroundHandle $foregroundHandle -TargetProcessIds $excludedProcessIds
+                $script:LastForegroundWindow = $foregroundHandle
+            }
+
             foreach ($window in $windows) {
                 $popup = Find-MatchingPopupInWindow -Window $window
                 if ($null -eq $popup) {
@@ -586,7 +723,7 @@ try {
 
                 $script:RetryCount++
                 Write-Log -Message ('Retry clicked. pid={0}; process={1}; window="{2}"; retryCount={3}' -f $processId, $processName, $windowName, $script:RetryCount)
-                [void](Restore-LastExternalForegroundWindow -TargetProcessId $processId)
+                [void](Restore-PendingFocusWindow -TargetProcessId $processId)
 
                 if ($ExitAfterFirstRetry) {
                     Write-Log -Message 'ExitAfterFirstRetry enabled. Watcher will stop now.'
