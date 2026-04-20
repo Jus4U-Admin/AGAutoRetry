@@ -51,6 +51,14 @@ namespace AGAutoRetry
         [DllImport("user32.dll")]
         [return: MarshalAs(UnmanagedType.Bool)]
         public static extern bool IsWindowVisible(IntPtr hWnd);
+
+        [DllImport("user32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool IsIconic(IntPtr hWnd);
+
+        [DllImport("user32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool IsZoomed(IntPtr hWnd);
     }
 }
 '@
@@ -438,7 +446,18 @@ function Restore-LastExternalForegroundWindow {
         Start-Sleep -Milliseconds $delayMs
     }
 
-    [AGAutoRetry.NativeMethods]::ShowWindowAsync($handle, 9) | Out-Null
+    $windowIsMinimized = [AGAutoRetry.NativeMethods]::IsIconic($handle)
+    $windowIsMaximized = [AGAutoRetry.NativeMethods]::IsZoomed($handle)
+
+    if ($windowIsMinimized) {
+        # Only restore when the saved window is actually minimized.
+        [AGAutoRetry.NativeMethods]::ShowWindowAsync($handle, 9) | Out-Null
+    }
+    elseif ($windowIsMaximized) {
+        # Preserve a maximized window instead of restoring it to normal size.
+        [AGAutoRetry.NativeMethods]::ShowWindowAsync($handle, 3) | Out-Null
+    }
+
     [void][AGAutoRetry.NativeMethods]::SetForegroundWindow($handle)
 
     $foregroundAfter = [AGAutoRetry.NativeMethods]::GetForegroundWindow()

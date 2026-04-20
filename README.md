@@ -53,6 +53,7 @@ If the popup does not match, it does nothing.
 - Keepalive trigger for self-recovery
 - Single-instance protection
 - Best-effort focus return to the previous app after `Retry`
+- Preserves maximized windows when returning focus
 - Cooldown between retry attempts
 - Safety cap on retries per execution
 - Controlled local test harness
