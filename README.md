@@ -2,6 +2,8 @@
 
 AG Auto Retry is a focused Windows watcher for Antigravity.
 
+It is also a local, no-patch alternative for people who found this problem through patch-based approaches such as `BigInt`.
+
 It automatically clicks `Retry` when Antigravity shows the exact failure popup that contains all of these markers:
 
 - `Agent terminated due to error`
@@ -29,6 +31,11 @@ If you found this repository by searching for any of the terms below, you are in
 - `error antigravity 504`
 - `antigravity error 504`
 - `agent terminated due to error antigravity`
+- `BigInt Antigravity`
+- `BigInt Antigravity patch`
+- `BigInt alternative Antigravity`
+- `BigInt Retry Antigravity`
+- `Agent terminated due to error BigInt`
 
 ## Why This Project Exists
 
@@ -43,6 +50,19 @@ This project packages a narrow, local-only automation that:
 - only clicks `Retry` when the popup signature matches exactly
 
 If the popup does not match, it does nothing.
+
+## If You Found BigInt
+
+Some people arrive here after finding patch-based fixes such as `BigInt`.
+
+AG Auto Retry is a different approach:
+
+- it does not patch Antigravity
+- it stays local to the Windows user session
+- it is reversible and easy to uninstall
+- it is intentionally limited to the exact `Retry` popup signature
+
+If you want a narrower workaround that avoids modifying Antigravity itself, this repository is meant for that use case.
 
 ## Features
 
