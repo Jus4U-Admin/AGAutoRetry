@@ -9,6 +9,9 @@
   "RetryButtonText": "Retry",
   "RestorePreviousFocusAfterRetry": true,
   "FocusRestoreDelayMilliseconds": 250,
+  "FocusStealDetectionWindowSeconds": 5,
+  "LogFlushIntervalMilliseconds": 1000,
+  "LogFlushBatchSize": 50,
   "TargetProcessNames": [
     "Antigravity"
   ],

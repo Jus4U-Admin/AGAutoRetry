@@ -94,6 +94,9 @@ function Get-DefaultConfig {
         HarnessWindowTitle          = 'AG Auto Retry Harness'
         RestorePreviousFocusAfterRetry = $true
         FocusRestoreDelayMilliseconds  = 250
+        FocusStealDetectionWindowSeconds = 5
+        LogFlushIntervalMilliseconds   = 1000
+        LogFlushBatchSize              = 50
     }
 }
 
@@ -122,7 +125,42 @@ function Write-Log {
 
     $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'
     $line = '{0} [{1}] {2}' -f $timestamp, $Level.ToUpperInvariant(), $Message
-    [System.IO.File]::AppendAllText($script:LogPath, $line + [Environment]::NewLine, [System.Text.Encoding]::UTF8)
+    $null = $script:LogQueue.Enqueue($line)
+}
+
+function Flush-LogQueue {
+    param([switch]$Force)
+
+    if ($null -eq $script:LogQueue) {
+        return
+    }
+
+    $queuedCount = $script:LogQueue.Count
+    if ($queuedCount -eq 0) {
+        return
+    }
+
+    if (-not $Force) {
+        $flushBatchSize = if ($null -ne $script:Config) { [int]$script:Config.LogFlushBatchSize } else { 50 }
+        $now = Get-Date
+        if ($queuedCount -lt $flushBatchSize -and $now -lt $script:NextLogFlushAt) {
+            return
+        }
+    }
+
+    $buffer = New-Object System.Text.StringBuilder
+    $line = $null
+    while ($script:LogQueue.TryDequeue([ref]$line)) {
+        [void]$buffer.AppendLine($line)
+    }
+
+    if ($buffer.Length -eq 0) {
+        return
+    }
+
+    [System.IO.File]::AppendAllText($script:LogPath, $buffer.ToString(), [System.Text.Encoding]::UTF8)
+    $flushIntervalMs = if ($null -ne $script:Config) { [int]$script:Config.LogFlushIntervalMilliseconds } else { 1000 }
+    $script:NextLogFlushAt = (Get-Date).AddMilliseconds($flushIntervalMs)
 }
 
 function Initialize-Configuration {
@@ -421,6 +459,64 @@ function Clear-PendingFocusRestore {
     $script:PendingFocusRestoreWindowTitle = ''
 }
 
+function Set-PendingFocusRestoreWindow {
+    param(
+        [IntPtr]$Handle,
+        [int]$ProcessId,
+        [string]$WindowTitle,
+        [int]$TargetProcessId,
+        [string]$Reason
+    )
+
+    if (-not [bool]$script:Config.RestorePreviousFocusAfterRetry) {
+        Clear-PendingFocusRestore
+        return $false
+    }
+
+    $Handle = Get-TopLevelWindowHandle -Handle $Handle
+    if ($Handle -eq [IntPtr]::Zero) {
+        Clear-PendingFocusRestore
+        return $false
+    }
+
+    if (-not [AGAutoRetry.NativeMethods]::IsWindow($Handle)) {
+        Clear-PendingFocusRestore
+        return $false
+    }
+
+    if ($null -eq $ProcessId -or $ProcessId -le 0) {
+        $ProcessId = Get-WindowProcessId -Handle $Handle
+    }
+
+    if ($null -eq $ProcessId -or $ProcessId -le 0) {
+        Clear-PendingFocusRestore
+        return $false
+    }
+
+    if (($ProcessId -eq $TargetProcessId) -or ($ProcessId -eq $PID)) {
+        Clear-PendingFocusRestore
+        return $false
+    }
+
+    if ([string]::IsNullOrWhiteSpace($WindowTitle)) {
+        $WindowTitle = Get-WindowTitleFromHandle -Handle $Handle
+    }
+
+    $script:PendingFocusRestoreWindow = $Handle
+    $script:PendingFocusRestoreProcessId = $ProcessId
+    $script:PendingFocusRestoreWindowTitle = $WindowTitle
+
+    Write-Log -Message ('Focus restore armed from {0}. pid={1}; windowHandle={2}; window="{3}"' -f $Reason, $ProcessId, (Format-WindowHandle -Handle $Handle), $WindowTitle)
+    return $true
+}
+
+function Clear-FocusStealCandidate {
+    $script:FocusStealCandidateWindow = [IntPtr]::Zero
+    $script:FocusStealCandidateProcessId = $null
+    $script:FocusStealCandidateWindowTitle = ''
+    $script:FocusStealCandidateExpiresAt = $null
+}
+
 function Update-LastExternalForegroundWindow {
     param([int[]]$ExcludedProcessIds)
 
@@ -455,16 +551,155 @@ function Update-LastExternalForegroundWindow {
     $script:LastExternalForegroundWindow = $foregroundHandle
     $script:LastExternalForegroundProcessId = $foregroundProcessId
     $script:LastExternalForegroundWindowTitle = Get-WindowTitleFromHandle -Handle $foregroundHandle
+    $script:LastExternalForegroundSeenAt = Get-Date
 }
 
-function Update-PendingFocusRestoreCandidate {
+function Stage-FocusStealCandidate {
+    param([int]$TargetProcessId)
+
+    if (-not [bool]$script:Config.RestorePreviousFocusAfterRetry) {
+        Clear-FocusStealCandidate
+        return
+    }
+
+    $externalHandle = $script:LastExternalForegroundWindow
+    if ($externalHandle -eq [IntPtr]::Zero) {
+        Clear-FocusStealCandidate
+        return
+    }
+
+    if (-not [AGAutoRetry.NativeMethods]::IsWindow($externalHandle)) {
+        Clear-FocusStealCandidate
+        return
+    }
+
+    $externalProcessId = Get-WindowProcessId -Handle $externalHandle
+    if ($null -eq $externalProcessId -or $externalProcessId -le 0) {
+        Clear-FocusStealCandidate
+        return
+    }
+
+    if (($externalProcessId -eq $TargetProcessId) -or ($externalProcessId -eq $PID)) {
+        Clear-FocusStealCandidate
+        return
+    }
+
+    $script:FocusStealCandidateWindow = $externalHandle
+    $script:FocusStealCandidateProcessId = $externalProcessId
+    $script:FocusStealCandidateWindowTitle = $script:LastExternalForegroundWindowTitle
+    $script:FocusStealCandidateExpiresAt = (Get-Date).AddSeconds([int]$script:Config.FocusStealDetectionWindowSeconds)
+
+    Write-Log -Message ('Focus steal candidate staged. pid={0}; windowHandle={1}; window="{2}"' -f $externalProcessId, (Format-WindowHandle -Handle $externalHandle), $script:FocusStealCandidateWindowTitle)
+}
+
+function Promote-FocusStealCandidateToPendingRestore {
+    if ($script:FocusStealCandidateWindow -eq [IntPtr]::Zero) {
+        return $false
+    }
+
+    if ($null -ne $script:FocusStealCandidateExpiresAt -and (Get-Date) -gt $script:FocusStealCandidateExpiresAt) {
+        Clear-FocusStealCandidate
+        return $false
+    }
+
+    $armed = Set-PendingFocusRestoreWindow `
+        -Handle $script:FocusStealCandidateWindow `
+        -ProcessId $script:FocusStealCandidateProcessId `
+        -WindowTitle $script:FocusStealCandidateWindowTitle `
+        -TargetProcessId 0 `
+        -Reason 'focus-steal candidate'
+    Clear-FocusStealCandidate
+    return $armed
+}
+
+function Try-ArmRecentExternalFocusRestore {
+    param([int]$TargetProcessId)
+
+    if ($script:PendingFocusRestoreWindow -ne [IntPtr]::Zero) {
+        return $true
+    }
+
+    if ($script:LastExternalForegroundWindow -eq [IntPtr]::Zero -or $null -eq $script:LastExternalForegroundSeenAt) {
+        return $false
+    }
+
+    $maxAge = [TimeSpan]::FromSeconds([int]$script:Config.FocusStealDetectionWindowSeconds)
+    if (((Get-Date) - $script:LastExternalForegroundSeenAt) -gt $maxAge) {
+        return $false
+    }
+
+    $externalHandle = $script:LastExternalForegroundWindow
+    if (-not [AGAutoRetry.NativeMethods]::IsWindow($externalHandle)) {
+        return $false
+    }
+
+    $externalProcessId = $script:LastExternalForegroundProcessId
+    if ($null -eq $externalProcessId -or $externalProcessId -le 0) {
+        $externalProcessId = Get-WindowProcessId -Handle $externalHandle
+    }
+
+    if ($null -eq $externalProcessId -or $externalProcessId -le 0) {
+        return $false
+    }
+
+    if (($externalProcessId -eq $TargetProcessId) -or ($externalProcessId -eq $PID)) {
+        return $false
+    }
+
+    return (Set-PendingFocusRestoreWindow `
+        -Handle $externalHandle `
+        -ProcessId $externalProcessId `
+        -WindowTitle $script:LastExternalForegroundWindowTitle `
+        -TargetProcessId $TargetProcessId `
+        -Reason 'recent external focus')
+}
+
+function Try-ArmExactForegroundFocusRestore {
     param(
-        [System.Windows.Automation.AutomationElement[]]$TargetWindows,
         [IntPtr]$ForegroundHandle,
-        [int[]]$TargetProcessIds
+        [int[]]$TargetProcessIds,
+        [int]$TargetProcessId
     )
 
     if (-not [bool]$script:Config.RestorePreviousFocusAfterRetry) {
+        return $false
+    }
+
+    $ForegroundHandle = Get-TopLevelWindowHandle -Handle $ForegroundHandle
+    if ($ForegroundHandle -eq [IntPtr]::Zero) {
+        return $false
+    }
+
+    if (-not [AGAutoRetry.NativeMethods]::IsWindow($ForegroundHandle)) {
+        return $false
+    }
+
+    $foregroundProcessId = Get-WindowProcessId -Handle $ForegroundHandle
+    if ($null -eq $foregroundProcessId -or $foregroundProcessId -le 0) {
+        return $false
+    }
+
+    if (($foregroundProcessId -eq $PID) -or ($TargetProcessIds -contains $foregroundProcessId)) {
+        return $false
+    }
+
+    return (Set-PendingFocusRestoreWindow `
+        -Handle $ForegroundHandle `
+        -ProcessId $foregroundProcessId `
+        -WindowTitle (Get-WindowTitleFromHandle -Handle $ForegroundHandle) `
+        -TargetProcessId $TargetProcessId `
+        -Reason 'exact pre-click foreground')
+}
+
+function Update-FocusStealState {
+    param(
+        [IntPtr]$ForegroundHandle,
+        [int[]]$TargetProcessIds,
+        [int]$PreviousForegroundProcessId
+    )
+
+    if (-not [bool]$script:Config.RestorePreviousFocusAfterRetry) {
+        Clear-FocusStealCandidate
         Clear-PendingFocusRestore
         return
     }
@@ -473,124 +708,100 @@ function Update-PendingFocusRestoreCandidate {
 
     $foregroundProcessId = Get-WindowProcessId -Handle $ForegroundHandle
     if ($null -eq $foregroundProcessId -or $foregroundProcessId -le 0) {
-        Clear-PendingFocusRestore
+        Clear-FocusStealCandidate
         return
     }
 
-    if (-not ($TargetProcessIds -contains $foregroundProcessId)) {
-        Clear-PendingFocusRestore
+    $isTargetForeground = $TargetProcessIds -contains $foregroundProcessId
+    $wasTargetForeground = ($PreviousForegroundProcessId -gt 0) -and ($TargetProcessIds -contains $PreviousForegroundProcessId)
+
+    if ($isTargetForeground -and (-not $wasTargetForeground)) {
+        Stage-FocusStealCandidate -TargetProcessId $foregroundProcessId
         return
     }
 
-    $foregroundWindow = $null
-    foreach ($window in $TargetWindows) {
-        if ((Get-AutomationElementWindowHandle -Element $window) -eq $ForegroundHandle) {
-            $foregroundWindow = $window
-            break
+    if (-not $isTargetForeground) {
+        if ($script:FocusStealCandidateWindow -ne [IntPtr]::Zero) {
+            Clear-FocusStealCandidate
         }
-    }
-
-    if ($null -eq $foregroundWindow) {
-        Clear-PendingFocusRestore
         return
     }
 
-    $popup = Find-MatchingPopupInWindow -Window $foregroundWindow
-    if ($null -eq $popup) {
-        # If Antigravity reached the foreground without the exact Retry popup already present,
-        # assume the user intentionally focused it and do not restore an older external window later.
-        Clear-PendingFocusRestore
-        return
+    if ($script:FocusStealCandidateWindow -ne [IntPtr]::Zero -and $null -ne $script:FocusStealCandidateExpiresAt -and (Get-Date) -gt $script:FocusStealCandidateExpiresAt) {
+        Write-Log -Message 'Focus steal candidate expired before popup confirmation.'
+        Clear-FocusStealCandidate
     }
-
-    $externalHandle = $script:LastExternalForegroundWindow
-    if ($externalHandle -eq [IntPtr]::Zero) {
-        Clear-PendingFocusRestore
-        return
-    }
-
-    if (-not [AGAutoRetry.NativeMethods]::IsWindow($externalHandle)) {
-        Clear-PendingFocusRestore
-        return
-    }
-
-    $externalProcessId = Get-WindowProcessId -Handle $externalHandle
-    if ($null -eq $externalProcessId -or $externalProcessId -le 0) {
-        Clear-PendingFocusRestore
-        return
-    }
-
-    if (($externalProcessId -eq $foregroundProcessId) -or ($externalProcessId -eq $PID)) {
-        Clear-PendingFocusRestore
-        return
-    }
-
-    $script:PendingFocusRestoreWindow = $externalHandle
-    $script:PendingFocusRestoreProcessId = $externalProcessId
-    $script:PendingFocusRestoreWindowTitle = $script:LastExternalForegroundWindowTitle
 }
 
-function Restore-PendingFocusWindow {
-    param([int]$TargetProcessId)
+function Restore-FocusWindow {
+    param(
+        [IntPtr]$Handle,
+        [int]$SavedProcessId,
+        [string]$WindowTitle,
+        [int]$TargetProcessId,
+        [string]$ContextLabel = 'after Retry',
+        [switch]$SkipDelay
+    )
 
     if (-not [bool]$script:Config.RestorePreviousFocusAfterRetry) {
         return $false
     }
 
-    $handle = $script:PendingFocusRestoreWindow
-    $savedProcessId = $script:PendingFocusRestoreProcessId
-    $windowTitle = $script:PendingFocusRestoreWindowTitle
-    Clear-PendingFocusRestore
-
-    if ($handle -eq [IntPtr]::Zero) {
+    if ($Handle -eq [IntPtr]::Zero) {
         return $false
     }
 
-    if (-not [AGAutoRetry.NativeMethods]::IsWindow($handle)) {
-        Write-Log -Level 'WARN' -Message ('Retry clicked, but the saved foreground window is no longer valid. windowHandle={0}' -f (Format-WindowHandle -Handle $handle))
+    if (-not [AGAutoRetry.NativeMethods]::IsWindow($Handle)) {
+        Write-Log -Level 'WARN' -Message ('Focus restore failed {0}: saved window is no longer valid. windowHandle={1}' -f $ContextLabel, (Format-WindowHandle -Handle $Handle))
         return $false
     }
 
-    if ($null -eq $savedProcessId -or $savedProcessId -le 0) {
-        $savedProcessId = Get-WindowProcessId -Handle $handle
+    if ($null -eq $SavedProcessId -or $SavedProcessId -le 0) {
+        $SavedProcessId = Get-WindowProcessId -Handle $Handle
     }
 
-    if ($null -eq $savedProcessId -or $savedProcessId -le 0) {
-        Write-Log -Level 'WARN' -Message ('Retry clicked, but the saved foreground window no longer has a resolvable process. windowHandle={0}' -f (Format-WindowHandle -Handle $handle))
+    if ($null -eq $SavedProcessId -or $SavedProcessId -le 0) {
+        Write-Log -Level 'WARN' -Message ('Focus restore failed {0}: saved window no longer has a resolvable process. windowHandle={1}' -f $ContextLabel, (Format-WindowHandle -Handle $Handle))
         return $false
     }
 
-    if (($savedProcessId -eq $TargetProcessId) -or ($savedProcessId -eq $PID)) {
+    if (($SavedProcessId -eq $TargetProcessId) -or ($SavedProcessId -eq $PID)) {
         return $false
     }
 
-    if ([string]::IsNullOrWhiteSpace($windowTitle)) {
-        $windowTitle = Get-WindowTitleFromHandle -Handle $handle
+    if ([string]::IsNullOrWhiteSpace($WindowTitle)) {
+        $WindowTitle = Get-WindowTitleFromHandle -Handle $Handle
     }
 
-    $delayMs = [int]$script:Config.FocusRestoreDelayMilliseconds
-    if ($delayMs -gt 0) {
-        Start-Sleep -Milliseconds $delayMs
+    $currentForegroundHandle = Get-TopLevelWindowHandle -Handle ([AGAutoRetry.NativeMethods]::GetForegroundWindow())
+    if ($currentForegroundHandle -eq $Handle) {
+        Write-Log -Message ('Focus already correct {0}. pid={1}; windowHandle={2}; window="{3}"' -f $ContextLabel, $SavedProcessId, (Format-WindowHandle -Handle $Handle), $WindowTitle)
+        return $true
     }
 
-    $windowIsMinimized = [AGAutoRetry.NativeMethods]::IsIconic($handle)
-    $windowIsMaximized = [AGAutoRetry.NativeMethods]::IsZoomed($handle)
+    if (-not $SkipDelay) {
+        $delayMs = [int]$script:Config.FocusRestoreDelayMilliseconds
+        if ($delayMs -gt 0) {
+            Start-Sleep -Milliseconds $delayMs
+        }
+    }
+
+    $windowIsMinimized = [AGAutoRetry.NativeMethods]::IsIconic($Handle)
+    $windowIsMaximized = [AGAutoRetry.NativeMethods]::IsZoomed($Handle)
 
     if ($windowIsMinimized) {
-        # Only restore when the saved window is actually minimized.
-        [AGAutoRetry.NativeMethods]::ShowWindowAsync($handle, 9) | Out-Null
+        [AGAutoRetry.NativeMethods]::ShowWindowAsync($Handle, 9) | Out-Null
     }
     elseif ($windowIsMaximized) {
-        # Preserve a maximized window instead of restoring it to normal size.
-        [AGAutoRetry.NativeMethods]::ShowWindowAsync($handle, 3) | Out-Null
+        [AGAutoRetry.NativeMethods]::ShowWindowAsync($Handle, 3) | Out-Null
     }
 
-    [void][AGAutoRetry.NativeMethods]::SetForegroundWindow($handle)
+    [void][AGAutoRetry.NativeMethods]::SetForegroundWindow($Handle)
 
-    $foregroundAfter = [AGAutoRetry.NativeMethods]::GetForegroundWindow()
-    if ($foregroundAfter -ne $handle) {
+    $foregroundAfter = Get-TopLevelWindowHandle -Handle ([AGAutoRetry.NativeMethods]::GetForegroundWindow())
+    if ($foregroundAfter -ne $Handle) {
         try {
-            $element = [System.Windows.Automation.AutomationElement]::FromHandle($handle)
+            $element = [System.Windows.Automation.AutomationElement]::FromHandle($Handle)
             if ($null -ne $element) {
                 $element.SetFocus()
             }
@@ -598,26 +809,54 @@ function Restore-PendingFocusWindow {
         catch {
         }
     }
-    if ($foregroundAfter -ne $handle) {
+    if ($foregroundAfter -ne $Handle) {
         try {
             $shell = New-Object -ComObject WScript.Shell
-            $activated = $shell.AppActivate($savedProcessId)
-            if ((-not $activated) -and (-not [string]::IsNullOrWhiteSpace($windowTitle))) {
-                $activated = $shell.AppActivate($windowTitle)
+            $activated = $shell.AppActivate($SavedProcessId)
+            if ((-not $activated) -and (-not [string]::IsNullOrWhiteSpace($WindowTitle))) {
+                $activated = $shell.AppActivate($WindowTitle)
             }
         }
         catch {
         }
     }
 
-    $foregroundAfter = [AGAutoRetry.NativeMethods]::GetForegroundWindow()
-    if ($foregroundAfter -eq $handle) {
-        Write-Log -Message ('Focus restored after Retry. pid={0}; windowHandle={1}; window="{2}"' -f $savedProcessId, (Format-WindowHandle -Handle $handle), $windowTitle)
+    $foregroundAfter = Get-TopLevelWindowHandle -Handle ([AGAutoRetry.NativeMethods]::GetForegroundWindow())
+    if ($foregroundAfter -eq $Handle) {
+        Write-Log -Message ('Focus restored {0}. pid={1}; windowHandle={2}; window="{3}"' -f $ContextLabel, $SavedProcessId, (Format-WindowHandle -Handle $Handle), $WindowTitle)
         return $true
     }
 
-    Write-Log -Level 'WARN' -Message ('Retry clicked, but focus restore did not succeed. pid={0}; windowHandle={1}; window="{2}"' -f $savedProcessId, (Format-WindowHandle -Handle $handle), $windowTitle)
+    Write-Log -Level 'WARN' -Message ('Focus restore did not succeed {0}. pid={1}; windowHandle={2}; window="{3}"' -f $ContextLabel, $SavedProcessId, (Format-WindowHandle -Handle $Handle), $WindowTitle)
     return $false
+}
+
+function Try-RestorePendingFocusBeforeRetry {
+    param([int]$TargetProcessId)
+
+    return Restore-FocusWindow `
+        -Handle $script:PendingFocusRestoreWindow `
+        -SavedProcessId $script:PendingFocusRestoreProcessId `
+        -WindowTitle $script:PendingFocusRestoreWindowTitle `
+        -TargetProcessId $TargetProcessId `
+        -ContextLabel 'before Retry' `
+        -SkipDelay
+}
+
+function Restore-PendingFocusWindow {
+    param([int]$TargetProcessId)
+
+    $handle = $script:PendingFocusRestoreWindow
+    $savedProcessId = $script:PendingFocusRestoreProcessId
+    $windowTitle = $script:PendingFocusRestoreWindowTitle
+    Clear-PendingFocusRestore
+
+    return Restore-FocusWindow `
+        -Handle $handle `
+        -SavedProcessId $savedProcessId `
+        -WindowTitle $windowTitle `
+        -TargetProcessId $TargetProcessId `
+        -ContextLabel 'after Retry'
 }
 
 function Invoke-Retry {
@@ -642,13 +881,21 @@ $script:HasMutex = $false
 $script:RetryCount = 0
 $script:Config = $null
 $script:LogPath = Join-Path $script:ScriptRoot 'ag-auto-retry.log'
+$script:LogQueue = [System.Collections.Concurrent.ConcurrentQueue[string]]::new()
+$script:NextLogFlushAt = Get-Date
 $script:LastExternalForegroundWindow = [IntPtr]::Zero
 $script:LastExternalForegroundProcessId = $null
 $script:LastExternalForegroundWindowTitle = ''
+$script:LastExternalForegroundSeenAt = $null
 $script:PendingFocusRestoreWindow = [IntPtr]::Zero
 $script:PendingFocusRestoreProcessId = $null
 $script:PendingFocusRestoreWindowTitle = ''
+$script:FocusStealCandidateWindow = [IntPtr]::Zero
+$script:FocusStealCandidateProcessId = $null
+$script:FocusStealCandidateWindowTitle = ''
+$script:FocusStealCandidateExpiresAt = $null
 $script:LastForegroundWindow = [IntPtr]::Zero
+$script:LastForegroundProcessId = 0
 
 try {
     Hide-ConsoleWindow
@@ -700,9 +947,15 @@ try {
             Update-LastExternalForegroundWindow -ExcludedProcessIds $excludedProcessIds
 
             $foregroundHandle = Get-TopLevelWindowHandle -Handle ([AGAutoRetry.NativeMethods]::GetForegroundWindow())
+            $loopForegroundProcessId = Get-WindowProcessId -Handle $foregroundHandle
+            $loopStartedOutsideTarget = -not ($excludedProcessIds -contains $loopForegroundProcessId)
             if ($foregroundHandle -ne $script:LastForegroundWindow) {
-                Update-PendingFocusRestoreCandidate -TargetWindows $windows -ForegroundHandle $foregroundHandle -TargetProcessIds $excludedProcessIds
+                Update-FocusStealState -ForegroundHandle $foregroundHandle -TargetProcessIds $excludedProcessIds -PreviousForegroundProcessId $script:LastForegroundProcessId
                 $script:LastForegroundWindow = $foregroundHandle
+                $script:LastForegroundProcessId = $loopForegroundProcessId
+            }
+            elseif ($script:FocusStealCandidateWindow -ne [IntPtr]::Zero) {
+                Update-FocusStealState -ForegroundHandle $foregroundHandle -TargetProcessIds $excludedProcessIds -PreviousForegroundProcessId $script:LastForegroundProcessId
             }
 
             foreach ($window in $windows) {
@@ -715,6 +968,26 @@ try {
                 $processName = Get-ProcessNameById -ProcessId $processId
                 $windowName = $window.Current.Name
                 Write-Log -Message ('Valid popup detected. pid={0}; process={1}; window="{2}"' -f $processId, $processName, $windowName)
+                $currentForegroundHandle = Get-TopLevelWindowHandle -Handle ([AGAutoRetry.NativeMethods]::GetForegroundWindow())
+                $currentForegroundProcessId = Get-WindowProcessId -Handle $currentForegroundHandle
+                $exactForegroundRestoreArmed = Try-ArmExactForegroundFocusRestore `
+                    -ForegroundHandle $currentForegroundHandle `
+                    -TargetProcessIds $excludedProcessIds `
+                    -TargetProcessId $processId
+
+                if ((-not $exactForegroundRestoreArmed) -and ($excludedProcessIds -contains $currentForegroundProcessId)) {
+                    if (-not (Promote-FocusStealCandidateToPendingRestore)) {
+                        if ($loopStartedOutsideTarget) {
+                            [void](Try-ArmRecentExternalFocusRestore -TargetProcessId $processId)
+                        }
+                    }
+                }
+
+                $preClickFocusRestored = $false
+                if ((-not $exactForegroundRestoreArmed) -and ($excludedProcessIds -contains $currentForegroundProcessId) -and ($script:PendingFocusRestoreWindow -ne [IntPtr]::Zero)) {
+                    $preClickFocusRestored = Try-RestorePendingFocusBeforeRetry -TargetProcessId $processId
+                }
+
                 $invoked = Invoke-Retry -RetryButton $popup.RetryButton
                 if (-not $invoked) {
                     Write-Log -Message ('Retry button detected but still disabled. pid={0}; process={1}; window="{2}"' -f $processId, $processName, $windowName)
@@ -723,7 +996,13 @@ try {
 
                 $script:RetryCount++
                 Write-Log -Message ('Retry clicked. pid={0}; process={1}; window="{2}"; retryCount={3}' -f $processId, $processName, $windowName, $script:RetryCount)
-                [void](Restore-PendingFocusWindow -TargetProcessId $processId)
+
+                if ($preClickFocusRestored) {
+                    Clear-PendingFocusRestore
+                }
+                else {
+                    [void](Restore-PendingFocusWindow -TargetProcessId $processId)
+                }
 
                 if ($ExitAfterFirstRetry) {
                     Write-Log -Message 'ExitAfterFirstRetry enabled. Watcher will stop now.'
@@ -738,11 +1017,13 @@ try {
             Write-Log -Level 'ERROR' -Message ('Watcher loop error: {0}' -f $_.Exception.Message)
         }
 
+        Flush-LogQueue
         Start-Sleep -Milliseconds ([int]$script:Config.PollIntervalMilliseconds)
     }
 }
 catch {
     Write-Log -Level 'ERROR' -Message ('Fatal watcher error: {0}' -f $_.Exception.Message)
+    Flush-LogQueue -Force
     exit 1
 }
 finally {
@@ -760,5 +1041,6 @@ finally {
 
     if ($script:HasMutex) {
         Write-Log -Message 'Watcher stopped.'
+        Flush-LogQueue -Force
     }
 }
