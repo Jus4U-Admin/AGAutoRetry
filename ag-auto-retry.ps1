@@ -3,6 +3,7 @@ param(
     [ValidateSet('Production', 'TestHarness')]
     [string]$Mode = 'Production',
 
+    [Alias('ExitAfterFirstAction')]
     [switch]$ExitAfterFirstRetry,
 
     [string]$ConfigPath
@@ -90,6 +91,10 @@ function Get-DefaultConfig {
         RequiredMarkerText          = 'Agent terminated due to error'
         RequiredCompanionButtonText = 'Copy debug info'
         RetryButtonText             = 'Retry'
+        KeepWaitingWindowTitle      = 'Antigravity'
+        KeepWaitingMarkerText       = 'The window is not responding'
+        KeepWaitingButtonText       = 'Keep Waiting'
+        KeepWaitingCompanionButtonTexts = @('Reopen', 'Close')
         TargetProcessNames          = @('Antigravity')
         HarnessWindowTitle          = 'AG Auto Retry Harness'
         RestorePreviousFocusAfterRetry = $true
@@ -201,13 +206,7 @@ function Get-TargetProcessIds {
     return @()
 }
 
-function Get-TopLevelWindowsForProcessIds {
-    param([int[]]$ProcessIds)
-
-    if (-not $ProcessIds -or $ProcessIds.Count -eq 0) {
-        return @()
-    }
-
+function Get-AllTopLevelWindows {
     $desktop = [System.Windows.Automation.AutomationElement]::RootElement
     $children = $desktop.FindAll(
         [System.Windows.Automation.TreeScope]::Children,
@@ -218,7 +217,7 @@ function Get-TopLevelWindowsForProcessIds {
     for ($index = 0; $index -lt $children.Count; $index++) {
         $window = $children.Item($index)
         try {
-            if (($ProcessIds -contains $window.Current.ProcessId) -and (-not $window.Current.IsOffscreen)) {
+            if (-not $window.Current.IsOffscreen) {
                 [void]$result.Add($window)
             }
         }
@@ -229,18 +228,17 @@ function Get-TopLevelWindowsForProcessIds {
     return $result.ToArray()
 }
 
-function Get-TestHarnessWindows {
-    $desktop = [System.Windows.Automation.AutomationElement]::RootElement
-    $children = $desktop.FindAll(
-        [System.Windows.Automation.TreeScope]::Children,
-        [System.Windows.Automation.Condition]::TrueCondition
-    )
+function Get-TopLevelWindowsForProcessIds {
+    param([int[]]$ProcessIds)
+
+    if (-not $ProcessIds -or $ProcessIds.Count -eq 0) {
+        return @()
+    }
 
     $result = New-Object System.Collections.Generic.List[System.Windows.Automation.AutomationElement]
-    for ($index = 0; $index -lt $children.Count; $index++) {
-        $window = $children.Item($index)
+    foreach ($window in @(Get-AllTopLevelWindows)) {
         try {
-            if (($window.Current.Name -eq $script:Config.HarnessWindowTitle) -and (-not $window.Current.IsOffscreen)) {
+            if ($ProcessIds -contains $window.Current.ProcessId) {
                 [void]$result.Add($window)
             }
         }
@@ -249,6 +247,73 @@ function Get-TestHarnessWindows {
     }
 
     return $result.ToArray()
+}
+
+function Get-TopLevelWindowsByTitles {
+    param([string[]]$Titles)
+
+    $normalizedTitles = @(
+        $Titles |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+        Select-Object -Unique
+    )
+
+    if ($normalizedTitles.Count -eq 0) {
+        return @()
+    }
+
+    $result = New-Object System.Collections.Generic.List[System.Windows.Automation.AutomationElement]
+    foreach ($window in @(Get-AllTopLevelWindows)) {
+        try {
+            if ($normalizedTitles -contains $window.Current.Name) {
+                [void]$result.Add($window)
+            }
+        }
+        catch {
+        }
+    }
+
+    return $result.ToArray()
+}
+
+function Merge-UniqueWindows {
+    param([object[]]$WindowSets)
+
+    $result = New-Object System.Collections.Generic.List[System.Windows.Automation.AutomationElement]
+    $seen = @{}
+
+    foreach ($set in $WindowSets) {
+        foreach ($window in @($set)) {
+            if ($null -eq $window) {
+                continue
+            }
+
+            $handle = Get-AutomationElementWindowHandle -Element $window
+            $key = $null
+            if ($handle -ne [IntPtr]::Zero) {
+                $key = 'h:{0}' -f $handle.ToInt64()
+            }
+            else {
+                try {
+                    $key = 'r:{0}' -f (($window.GetRuntimeId()) -join '.')
+                }
+                catch {
+                    $key = 'g:{0}' -f ([guid]::NewGuid().ToString())
+                }
+            }
+
+            if (-not $seen.ContainsKey($key)) {
+                $seen[$key] = $true
+                [void]$result.Add($window)
+            }
+        }
+    }
+
+    return $result.ToArray()
+}
+
+function Get-TestHarnessWindows {
+    return @(Get-TopLevelWindowsByTitles -Titles @($script:Config.HarnessWindowTitle))
 }
 
 function Find-DescendantsByName {
@@ -321,29 +386,111 @@ function Find-FirstVisibleButtonByName {
     return $null
 }
 
-function Find-MatchingPopupInWindow {
-    param([System.Windows.Automation.AutomationElement]$Window)
+function Test-WindowTitleMatch {
+    param(
+        [System.Windows.Automation.AutomationElement]$Window,
+        [string[]]$Titles
+    )
 
-    $retryButtons = @(Find-VisibleButtonsByName -Root $Window -Name $script:Config.RetryButtonText)
-    if (-not $retryButtons -or $retryButtons.Count -eq 0) {
+    $normalizedTitles = @(
+        $Titles |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+        Select-Object -Unique
+    )
+
+    if ($normalizedTitles.Count -eq 0) {
+        return $true
+    }
+
+    try {
+        $windowName = [string]$Window.Current.Name
+        foreach ($title in $normalizedTitles) {
+            if ($windowName -eq $title) {
+                return $true
+            }
+
+            if ((-not [string]::IsNullOrWhiteSpace($windowName)) -and $windowName.IndexOf($title, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
+                return $true
+            }
+        }
+
+        return $false
+    }
+    catch {
+        return $false
+    }
+}
+
+function Find-MatchingPopupSignatureInWindow {
+    param(
+        [System.Windows.Automation.AutomationElement]$Window,
+        [string]$ActionButtonText,
+        [string[]]$RequiredTextNames,
+        [string[]]$RequiredButtonNames,
+        [string[]]$RequiredWindowTitles
+    )
+
+    if (-not (Test-WindowTitleMatch -Window $Window -Titles $RequiredWindowTitles)) {
         return $null
     }
 
+    $actionButtons = @(Find-VisibleButtonsByName -Root $Window -Name $ActionButtonText)
+    if (-not $actionButtons -or $actionButtons.Count -eq 0) {
+        return $null
+    }
+
+    $requiredTextNames = @(
+        $RequiredTextNames |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+        Select-Object -Unique
+    )
+    $requiredButtonNames = @(
+        $RequiredButtonNames |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+        Select-Object -Unique
+    )
+
     $walker = [System.Windows.Automation.TreeWalker]::ControlViewWalker
 
-    foreach ($retryButton in $retryButtons) {
-        $current = $retryButton
+    foreach ($actionButton in $actionButtons) {
+        $current = $actionButton
         for ($depth = 0; $depth -lt 10 -and $null -ne $current; $depth++) {
-            $marker = Find-FirstElementByName -Root $current -Name $script:Config.RequiredMarkerText
-            $copyButton = Find-FirstVisibleButtonByName -Root $current -Name $script:Config.RequiredCompanionButtonText
+            $requiredTexts = @{}
+            $allTextsPresent = $true
+            foreach ($textName in $requiredTextNames) {
+                $marker = Find-FirstElementByName -Root $current -Name $textName
+                if ($null -eq $marker) {
+                    $allTextsPresent = $false
+                    break
+                }
 
-            if ($null -ne $marker -and $null -ne $copyButton) {
+                $requiredTexts[$textName] = $marker
+            }
+
+            $requiredButtons = @{}
+            $allButtonsPresent = $true
+            if ($allTextsPresent) {
+                foreach ($buttonName in $requiredButtonNames) {
+                    $button = Find-FirstVisibleButtonByName -Root $current -Name $buttonName
+                    if ($null -eq $button) {
+                        $allButtonsPresent = $false
+                        break
+                    }
+
+                    $requiredButtons[$buttonName] = $button
+                }
+            }
+            else {
+                $allButtonsPresent = $false
+            }
+
+            if ($allTextsPresent -and $allButtonsPresent) {
                 return [pscustomobject]@{
-                    RetryButton = $retryButton
-                    CopyButton  = $copyButton
-                    Marker      = $marker
-                    Container   = $current
-                    Window      = $Window
+                    ActionButton    = $actionButton
+                    RequiredButtons = $requiredButtons
+                    RequiredTexts   = $requiredTexts
+                    Container       = $current
+                    Window          = $Window
                 }
             }
 
@@ -357,6 +504,84 @@ function Find-MatchingPopupInWindow {
     }
 
     return $null
+}
+
+function Find-RetryPopupInWindow {
+    param([System.Windows.Automation.AutomationElement]$Window)
+
+    $match = Find-MatchingPopupSignatureInWindow `
+        -Window $Window `
+        -ActionButtonText $script:Config.RetryButtonText `
+        -RequiredTextNames @($script:Config.RequiredMarkerText) `
+        -RequiredButtonNames @($script:Config.RequiredCompanionButtonText) `
+        -RequiredWindowTitles @()
+
+    if ($null -eq $match) {
+        return $null
+    }
+
+    return [pscustomobject]@{
+        ActionType   = 'Retry'
+        ButtonText   = $script:Config.RetryButtonText
+        ActionButton = $match.ActionButton
+        CopyButton   = $match.RequiredButtons[$script:Config.RequiredCompanionButtonText]
+        Marker       = $match.RequiredTexts[$script:Config.RequiredMarkerText]
+        Container    = $match.Container
+        Window       = $Window
+    }
+}
+
+function Get-KeepWaitingWindowTitles {
+    param([string]$CurrentMode)
+
+    if ($CurrentMode -eq 'TestHarness') {
+        return @($script:Config.HarnessWindowTitle)
+    }
+
+    return @($script:Config.KeepWaitingWindowTitle)
+}
+
+function Find-KeepWaitingPopupInWindow {
+    param(
+        [System.Windows.Automation.AutomationElement]$Window,
+        [string]$CurrentMode
+    )
+
+    $match = Find-MatchingPopupSignatureInWindow `
+        -Window $Window `
+        -ActionButtonText $script:Config.KeepWaitingButtonText `
+        -RequiredTextNames @($script:Config.KeepWaitingMarkerText) `
+        -RequiredButtonNames @($script:Config.KeepWaitingCompanionButtonTexts) `
+        -RequiredWindowTitles @(Get-KeepWaitingWindowTitles -CurrentMode $CurrentMode)
+
+    if ($null -eq $match) {
+        return $null
+    }
+
+    return [pscustomobject]@{
+        ActionType   = 'Keep Waiting'
+        ButtonText   = $script:Config.KeepWaitingButtonText
+        ActionButton = $match.ActionButton
+        ReopenButton = $match.RequiredButtons['Reopen']
+        CloseButton  = $match.RequiredButtons['Close']
+        Marker       = $match.RequiredTexts[$script:Config.KeepWaitingMarkerText]
+        Container    = $match.Container
+        Window       = $Window
+    }
+}
+
+function Find-ActionablePopupInWindow {
+    param(
+        [System.Windows.Automation.AutomationElement]$Window,
+        [string]$CurrentMode
+    )
+
+    $retryPopup = Find-RetryPopupInWindow -Window $Window
+    if ($null -ne $retryPopup) {
+        return $retryPopup
+    }
+
+    return (Find-KeepWaitingPopupInWindow -Window $Window -CurrentMode $CurrentMode)
 }
 
 function Get-ProcessNameById {
@@ -414,6 +639,23 @@ function Get-TopLevelWindowHandle {
     return $Handle
 }
 
+function Get-AutomationElementFromHandle {
+    param([IntPtr]$Handle)
+
+    if ($Handle -eq [IntPtr]::Zero) {
+        return $null
+    }
+
+    $Handle = Get-TopLevelWindowHandle -Handle $Handle
+
+    try {
+        return [System.Windows.Automation.AutomationElement]::FromHandle($Handle)
+    }
+    catch {
+        return $null
+    }
+}
+
 function Get-WindowProcessId {
     param([IntPtr]$Handle)
 
@@ -451,6 +693,31 @@ function Get-WindowTitleFromHandle {
     }
 
     return ''
+}
+
+function Test-IsTargetForegroundWindow {
+    param(
+        [IntPtr]$Handle,
+        [int[]]$TargetProcessIds,
+        [string]$CurrentMode
+    )
+
+    if ($Handle -eq [IntPtr]::Zero) {
+        return $false
+    }
+
+    $Handle = Get-TopLevelWindowHandle -Handle $Handle
+    $processId = Get-WindowProcessId -Handle $Handle
+    if ($null -ne $processId -and $TargetProcessIds -contains $processId) {
+        return $true
+    }
+
+    $element = Get-AutomationElementFromHandle -Handle $Handle
+    if ($null -eq $element) {
+        return $false
+    }
+
+    return ($null -ne (Find-KeepWaitingPopupInWindow -Window $element -CurrentMode $CurrentMode))
 }
 
 function Clear-PendingFocusRestore {
@@ -518,7 +785,10 @@ function Clear-FocusStealCandidate {
 }
 
 function Update-LastExternalForegroundWindow {
-    param([int[]]$ExcludedProcessIds)
+    param(
+        [int[]]$ExcludedProcessIds,
+        [string]$CurrentMode
+    )
 
     if (-not [bool]$script:Config.RestorePreviousFocusAfterRetry) {
         return
@@ -544,7 +814,7 @@ function Update-LastExternalForegroundWindow {
         return
     }
 
-    if ($ExcludedProcessIds -contains $foregroundProcessId) {
+    if (Test-IsTargetForegroundWindow -Handle $foregroundHandle -TargetProcessIds $ExcludedProcessIds -CurrentMode $CurrentMode) {
         return
     }
 
@@ -658,7 +928,8 @@ function Try-ArmExactForegroundFocusRestore {
     param(
         [IntPtr]$ForegroundHandle,
         [int[]]$TargetProcessIds,
-        [int]$TargetProcessId
+        [int]$TargetProcessId,
+        [string]$CurrentMode
     )
 
     if (-not [bool]$script:Config.RestorePreviousFocusAfterRetry) {
@@ -679,7 +950,11 @@ function Try-ArmExactForegroundFocusRestore {
         return $false
     }
 
-    if (($foregroundProcessId -eq $PID) -or ($TargetProcessIds -contains $foregroundProcessId)) {
+    if ($foregroundProcessId -eq $PID) {
+        return $false
+    }
+
+    if (Test-IsTargetForegroundWindow -Handle $ForegroundHandle -TargetProcessIds $TargetProcessIds -CurrentMode $CurrentMode) {
         return $false
     }
 
@@ -695,7 +970,8 @@ function Update-FocusStealState {
     param(
         [IntPtr]$ForegroundHandle,
         [int[]]$TargetProcessIds,
-        [int]$PreviousForegroundProcessId
+        [IntPtr]$PreviousForegroundHandle,
+        [string]$CurrentMode
     )
 
     if (-not [bool]$script:Config.RestorePreviousFocusAfterRetry) {
@@ -712,8 +988,8 @@ function Update-FocusStealState {
         return
     }
 
-    $isTargetForeground = $TargetProcessIds -contains $foregroundProcessId
-    $wasTargetForeground = ($PreviousForegroundProcessId -gt 0) -and ($TargetProcessIds -contains $PreviousForegroundProcessId)
+    $isTargetForeground = Test-IsTargetForegroundWindow -Handle $ForegroundHandle -TargetProcessIds $TargetProcessIds -CurrentMode $CurrentMode
+    $wasTargetForeground = Test-IsTargetForegroundWindow -Handle $PreviousForegroundHandle -TargetProcessIds $TargetProcessIds -CurrentMode $CurrentMode
 
     if ($isTargetForeground -and (-not $wasTargetForeground)) {
         Stage-FocusStealCandidate -TargetProcessId $foregroundProcessId
@@ -831,20 +1107,26 @@ function Restore-FocusWindow {
     return $false
 }
 
-function Try-RestorePendingFocusBeforeRetry {
-    param([int]$TargetProcessId)
+function Try-RestorePendingFocusBeforeAction {
+    param(
+        [int]$TargetProcessId,
+        [string]$ActionLabel = 'Retry'
+    )
 
     return Restore-FocusWindow `
         -Handle $script:PendingFocusRestoreWindow `
         -SavedProcessId $script:PendingFocusRestoreProcessId `
         -WindowTitle $script:PendingFocusRestoreWindowTitle `
         -TargetProcessId $TargetProcessId `
-        -ContextLabel 'before Retry' `
+        -ContextLabel ('before {0}' -f $ActionLabel) `
         -SkipDelay
 }
 
 function Restore-PendingFocusWindow {
-    param([int]$TargetProcessId)
+    param(
+        [int]$TargetProcessId,
+        [string]$ActionLabel = 'Retry'
+    )
 
     $handle = $script:PendingFocusRestoreWindow
     $savedProcessId = $script:PendingFocusRestoreProcessId
@@ -856,19 +1138,22 @@ function Restore-PendingFocusWindow {
         -SavedProcessId $savedProcessId `
         -WindowTitle $windowTitle `
         -TargetProcessId $TargetProcessId `
-        -ContextLabel 'after Retry'
+        -ContextLabel ('after {0}' -f $ActionLabel)
 }
 
-function Invoke-Retry {
-    param([System.Windows.Automation.AutomationElement]$RetryButton)
+function Invoke-AutomationButton {
+    param(
+        [System.Windows.Automation.AutomationElement]$Button,
+        [string]$ButtonLabel
+    )
 
-    if (-not $RetryButton.Current.IsEnabled) {
+    if (-not $Button.Current.IsEnabled) {
         return $false
     }
 
     $patternObject = $null
-    if (-not $RetryButton.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern, [ref]$patternObject)) {
-        throw 'InvokePattern not available on Retry button.'
+    if (-not $Button.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern, [ref]$patternObject)) {
+        throw ('InvokePattern not available on "{0}" button.' -f $ButtonLabel)
     }
 
     $invokePattern = [System.Windows.Automation.InvokePattern]$patternObject
@@ -879,6 +1164,8 @@ function Invoke-Retry {
 $script:Mutex = $null
 $script:HasMutex = $false
 $script:RetryCount = 0
+$script:KeepWaitingCount = 0
+$script:ActionCount = 0
 $script:Config = $null
 $script:LogPath = Join-Path $script:ScriptRoot 'ag-auto-retry.log'
 $script:LogQueue = [System.Collections.Concurrent.ConcurrentQueue[string]]::new()
@@ -915,18 +1202,20 @@ try {
         exit 0
     }
 
-    Write-Log -Message ('Watcher started. mode={0}; cooldown={1}s; poll={2}ms; maxRetries={3}' -f $Mode, $script:Config.CooldownSeconds, $script:Config.PollIntervalMilliseconds, $script:Config.MaxRetriesPerRun)
+    Write-Log -Message ('Watcher started. mode={0}; cooldown={1}s; poll={2}ms; maxActions={3}' -f $Mode, $script:Config.CooldownSeconds, $script:Config.PollIntervalMilliseconds, $script:Config.MaxRetriesPerRun)
 
     while ($true) {
-        if ($script:RetryCount -ge [int]$script:Config.MaxRetriesPerRun) {
-            Write-Log -Level 'ERROR' -Message ('Safety limit reached ({0} retries). Watcher is stopping.' -f $script:Config.MaxRetriesPerRun)
+        if ($script:ActionCount -ge [int]$script:Config.MaxRetriesPerRun) {
+            Write-Log -Level 'ERROR' -Message ('Safety limit reached ({0} automated clicks). Watcher is stopping.' -f $script:Config.MaxRetriesPerRun)
             exit 90
         }
 
         try {
             if ($Mode -eq 'Production') {
                 $processIds = @(Get-TargetProcessIds -CurrentMode $Mode)
-                $windows = @(Get-TopLevelWindowsForProcessIds -ProcessIds $processIds)
+                $processWindows = @(Get-TopLevelWindowsForProcessIds -ProcessIds $processIds)
+                $dialogWindows = @(Get-TopLevelWindowsByTitles -Titles @(Get-KeepWaitingWindowTitles -CurrentMode $Mode))
+                $windows = @(Merge-UniqueWindows -WindowSets @($processWindows, $dialogWindows))
                 $excludedProcessIds = $processIds
             }
             else {
@@ -944,38 +1233,42 @@ try {
                 )
             }
 
-            Update-LastExternalForegroundWindow -ExcludedProcessIds $excludedProcessIds
+            Update-LastExternalForegroundWindow -ExcludedProcessIds $excludedProcessIds -CurrentMode $Mode
 
             $foregroundHandle = Get-TopLevelWindowHandle -Handle ([AGAutoRetry.NativeMethods]::GetForegroundWindow())
             $loopForegroundProcessId = Get-WindowProcessId -Handle $foregroundHandle
-            $loopStartedOutsideTarget = -not ($excludedProcessIds -contains $loopForegroundProcessId)
+            $loopStartedOutsideTarget = -not (Test-IsTargetForegroundWindow -Handle $foregroundHandle -TargetProcessIds $excludedProcessIds -CurrentMode $Mode)
             if ($foregroundHandle -ne $script:LastForegroundWindow) {
-                Update-FocusStealState -ForegroundHandle $foregroundHandle -TargetProcessIds $excludedProcessIds -PreviousForegroundProcessId $script:LastForegroundProcessId
+                Update-FocusStealState -ForegroundHandle $foregroundHandle -TargetProcessIds $excludedProcessIds -PreviousForegroundHandle $script:LastForegroundWindow -CurrentMode $Mode
                 $script:LastForegroundWindow = $foregroundHandle
                 $script:LastForegroundProcessId = $loopForegroundProcessId
             }
             elseif ($script:FocusStealCandidateWindow -ne [IntPtr]::Zero) {
-                Update-FocusStealState -ForegroundHandle $foregroundHandle -TargetProcessIds $excludedProcessIds -PreviousForegroundProcessId $script:LastForegroundProcessId
+                Update-FocusStealState -ForegroundHandle $foregroundHandle -TargetProcessIds $excludedProcessIds -PreviousForegroundHandle $script:LastForegroundWindow -CurrentMode $Mode
             }
 
             foreach ($window in $windows) {
-                $popup = Find-MatchingPopupInWindow -Window $window
+                $popup = Find-ActionablePopupInWindow -Window $window -CurrentMode $Mode
                 if ($null -eq $popup) {
                     continue
                 }
 
+                $actionLabel = [string]$popup.ActionType
+                $buttonLabel = [string]$popup.ButtonText
                 $processId = $window.Current.ProcessId
                 $processName = Get-ProcessNameById -ProcessId $processId
                 $windowName = $window.Current.Name
-                Write-Log -Message ('Valid popup detected. pid={0}; process={1}; window="{2}"' -f $processId, $processName, $windowName)
+                Write-Log -Message ('Valid {0} popup detected. pid={1}; process={2}; window="{3}"' -f $actionLabel, $processId, $processName, $windowName)
                 $currentForegroundHandle = Get-TopLevelWindowHandle -Handle ([AGAutoRetry.NativeMethods]::GetForegroundWindow())
                 $currentForegroundProcessId = Get-WindowProcessId -Handle $currentForegroundHandle
+                $currentForegroundIsTarget = Test-IsTargetForegroundWindow -Handle $currentForegroundHandle -TargetProcessIds $excludedProcessIds -CurrentMode $Mode
                 $exactForegroundRestoreArmed = Try-ArmExactForegroundFocusRestore `
                     -ForegroundHandle $currentForegroundHandle `
                     -TargetProcessIds $excludedProcessIds `
-                    -TargetProcessId $processId
+                    -TargetProcessId $processId `
+                    -CurrentMode $Mode
 
-                if ((-not $exactForegroundRestoreArmed) -and ($excludedProcessIds -contains $currentForegroundProcessId)) {
+                if ((-not $exactForegroundRestoreArmed) -and $currentForegroundIsTarget) {
                     if (-not (Promote-FocusStealCandidateToPendingRestore)) {
                         if ($loopStartedOutsideTarget) {
                             [void](Try-ArmRecentExternalFocusRestore -TargetProcessId $processId)
@@ -984,28 +1277,38 @@ try {
                 }
 
                 $preClickFocusRestored = $false
-                if ((-not $exactForegroundRestoreArmed) -and ($excludedProcessIds -contains $currentForegroundProcessId) -and ($script:PendingFocusRestoreWindow -ne [IntPtr]::Zero)) {
-                    $preClickFocusRestored = Try-RestorePendingFocusBeforeRetry -TargetProcessId $processId
+                if ((-not $exactForegroundRestoreArmed) -and $currentForegroundIsTarget -and ($script:PendingFocusRestoreWindow -ne [IntPtr]::Zero)) {
+                    $preClickFocusRestored = Try-RestorePendingFocusBeforeAction -TargetProcessId $processId -ActionLabel $actionLabel
                 }
 
-                $invoked = Invoke-Retry -RetryButton $popup.RetryButton
+                $invoked = Invoke-AutomationButton -Button $popup.ActionButton -ButtonLabel $buttonLabel
                 if (-not $invoked) {
-                    Write-Log -Message ('Retry button detected but still disabled. pid={0}; process={1}; window="{2}"' -f $processId, $processName, $windowName)
+                    Write-Log -Message ('{0} button detected but still disabled. pid={1}; process={2}; window="{3}"' -f $buttonLabel, $processId, $processName, $windowName)
                     continue
                 }
 
-                $script:RetryCount++
-                Write-Log -Message ('Retry clicked. pid={0}; process={1}; window="{2}"; retryCount={3}' -f $processId, $processName, $windowName, $script:RetryCount)
+                $script:ActionCount++
+                if ($actionLabel -eq 'Retry') {
+                    $script:RetryCount++
+                    Write-Log -Message ('Retry clicked. pid={0}; process={1}; window="{2}"; retryCount={3}; actionCount={4}' -f $processId, $processName, $windowName, $script:RetryCount, $script:ActionCount)
+                }
+                elseif ($actionLabel -eq 'Keep Waiting') {
+                    $script:KeepWaitingCount++
+                    Write-Log -Message ('Keep Waiting clicked. pid={0}; process={1}; window="{2}"; keepWaitingCount={3}; actionCount={4}' -f $processId, $processName, $windowName, $script:KeepWaitingCount, $script:ActionCount)
+                }
+                else {
+                    Write-Log -Message ('{0} clicked. pid={1}; process={2}; window="{3}"; actionCount={4}' -f $actionLabel, $processId, $processName, $windowName, $script:ActionCount)
+                }
 
                 if ($preClickFocusRestored) {
                     Clear-PendingFocusRestore
                 }
                 else {
-                    [void](Restore-PendingFocusWindow -TargetProcessId $processId)
+                    [void](Restore-PendingFocusWindow -TargetProcessId $processId -ActionLabel $actionLabel)
                 }
 
                 if ($ExitAfterFirstRetry) {
-                    Write-Log -Message 'ExitAfterFirstRetry enabled. Watcher will stop now.'
+                    Write-Log -Message ('ExitAfterFirstRetry enabled. Watcher will stop now after {0}.' -f $actionLabel)
                     exit 0
                 }
 

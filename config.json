@@ -7,6 +7,13 @@
   "RequiredMarkerText": "Agent terminated due to error",
   "RequiredCompanionButtonText": "Copy debug info",
   "RetryButtonText": "Retry",
+  "KeepWaitingWindowTitle": "Antigravity",
+  "KeepWaitingMarkerText": "The window is not responding",
+  "KeepWaitingButtonText": "Keep Waiting",
+  "KeepWaitingCompanionButtonTexts": [
+    "Reopen",
+    "Close"
+  ],
   "RestorePreviousFocusAfterRetry": true,
   "FocusRestoreDelayMilliseconds": 250,
   "FocusStealDetectionWindowSeconds": 5,

@@ -193,10 +193,15 @@ function Assert-ProductionWatcherRunning {
     }
 }
 
-function Invoke-ControlledTest {
-    Write-Step 'Running controlled local test harness...'
+function Invoke-ControlledTestScenario {
+    param(
+        [ValidateSet('Retry', 'KeepWaiting')]
+        [string]$Scenario
+    )
 
-    $resultPath = Join-Path $baseDir 'test-harness-result.json'
+    $scenarioSlug = if ($Scenario -eq 'KeepWaiting') { 'keep-waiting' } else { 'retry' }
+    $expectedLogEntry = if ($Scenario -eq 'KeepWaiting') { 'Keep Waiting clicked' } else { 'Retry clicked' }
+    $resultPath = Join-Path $baseDir ('test-harness-{0}-result.json' -f $scenarioSlug)
     $logBefore = if (Test-Path -LiteralPath $logPath) { @(Get-Content -LiteralPath $logPath) } else { @() }
     if (Test-Path -LiteralPath $resultPath) {
         Remove-Item -LiteralPath $resultPath -Force
@@ -206,7 +211,7 @@ function Invoke-ControlledTest {
     $testWatcher = Start-Process -FilePath 'powershell.exe' -ArgumentList $watcherArgs -WindowStyle Hidden -PassThru
     Start-Sleep -Milliseconds 800
 
-    $harnessArgs = '-NoProfile -ExecutionPolicy Bypass -File "{0}" -ResultPath "{1}"' -f $harnessPath, $resultPath
+    $harnessArgs = '-NoProfile -ExecutionPolicy Bypass -File "{0}" -ResultPath "{1}" -Scenario {2}' -f $harnessPath, $resultPath, $Scenario
     $harness = Start-Process -FilePath 'powershell.exe' -ArgumentList $harnessArgs -PassThru
 
     $deadline = (Get-Date).AddSeconds(20)
@@ -214,7 +219,7 @@ function Invoke-ControlledTest {
     while ((Get-Date) -lt $deadline) {
         if (Test-Path -LiteralPath $resultPath) {
             $result = Get-Content -LiteralPath $resultPath -Raw | ConvertFrom-Json
-            if ($result.retryClicked) {
+            if ($result.actionClicked) {
                 break
             }
 
@@ -257,8 +262,8 @@ function Invoke-ControlledTest {
         throw ('Controlled test watcher exited with code {0}' -f $testWatcher.ExitCode)
     }
 
-    if (-not $result.retryClicked) {
-        throw ('Controlled test failed: {0}' -f $result.reason)
+    if (-not $result.actionClicked) {
+        throw ('Controlled {0} test failed: {1}' -f $Scenario, $result.reason)
     }
 
     $logAfter = if (Test-Path -LiteralPath $logPath) { @(Get-Content -LiteralPath $logPath) } else { @() }
@@ -268,9 +273,15 @@ function Invoke-ControlledTest {
         throw 'Controlled test did not record a TestHarness watcher start in the log.'
     }
 
-    if (-not ($newLogLines -match 'Retry clicked')) {
-        throw 'Controlled test did not record a Retry click in the log.'
+    if (-not ($newLogLines -match [regex]::Escape($expectedLogEntry))) {
+        throw ('Controlled test did not record a "{0}" log entry.' -f $expectedLogEntry)
     }
+}
+
+function Invoke-ControlledTest {
+    Write-Step 'Running controlled local test harness...'
+    Invoke-ControlledTestScenario -Scenario 'Retry'
+    Invoke-ControlledTestScenario -Scenario 'KeepWaiting'
 }
 
 function Show-StatusSummary {

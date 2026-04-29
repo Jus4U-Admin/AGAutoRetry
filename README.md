@@ -10,7 +10,13 @@ It automatically clicks `Retry` when Antigravity shows the exact failure popup t
 - `Copy debug info`
 - `Retry`
 
-The goal is simple: remove the need for someone to sit in front of the screen waiting to manually click `Retry` when this known dialog appears.
+The goal is simple: remove the need for someone to sit in front of the screen waiting to manually click `Retry` or `Keep Waiting` when these known dialogs appear.
+
+It also clicks `Keep Waiting` when Windows shows the Antigravity hang dialog with the exact signature:
+
+- window title containing `Antigravity`
+- text `The window is not responding`
+- buttons `Reopen`, `Close`, and `Keep Waiting`
 
 ## Search Terms
 
@@ -36,6 +42,9 @@ If you found this repository by searching for any of the terms below, you are in
 - `BigInt alternative Antigravity`
 - `BigInt Retry Antigravity`
 - `Agent terminated due to error BigInt`
+- `antigravity keep waiting`
+- `antigravity the window is not responding`
+- `the window is not responding keep waiting antigravity`
 
 ## Why This Project Exists
 
@@ -47,7 +56,7 @@ This project packages a narrow, local-only automation that:
 - starts at user logon
 - stays hidden
 - writes local logs
-- only clicks `Retry` when the popup signature matches exactly
+- only clicks `Retry` or `Keep Waiting` when the popup signature matches exactly
 
 If the popup does not match, it does nothing.
 
@@ -60,7 +69,7 @@ AG Auto Retry is a different approach:
 - it does not patch Antigravity
 - it stays local to the Windows user session
 - it is reversible and easy to uninstall
-- it is intentionally limited to the exact `Retry` popup signature
+- it is intentionally limited to the known `Retry` and `Keep Waiting` popup signatures
 
 If you want a narrower workaround that avoids modifying Antigravity itself, this repository is meant for that use case.
 
@@ -73,6 +82,7 @@ If you want a narrower workaround that avoids modifying Antigravity itself, this
 - Keepalive trigger for self-recovery
 - Single-instance protection
 - Best-effort focus return to the previous app after `Retry`
+- Best-effort focus return to the previous app after `Keep Waiting`
 - Preserves maximized windows when returning focus
 - Does not jump away when the user is already working inside Antigravity
 - Cooldown between retry attempts
@@ -99,7 +109,7 @@ It will not:
 - use coordinate-based clicking
 - depend on a terminal staying open
 
-It only acts when it sees the full intended popup signature in an Antigravity window.
+It only acts when it sees one of the full intended popup signatures in an Antigravity context.
 
 ## Architecture
 
@@ -117,13 +127,23 @@ Runtime deployment target:
 
 ## How Detection Works
 
-The watcher scans Antigravity UI descendants and only proceeds when it can find:
+The watcher scans Antigravity UI descendants and only proceeds when it can find the exact `Retry` signature:
 
 1. the text `Agent terminated due to error`
 2. a visible `Copy debug info` button
 3. a visible `Retry` button
 
 Only then does it invoke `Retry`.
+
+It also watches for the Windows hang dialog and only proceeds when it can find:
+
+1. a window title containing `Antigravity`
+2. the text `The window is not responding`
+3. a visible `Reopen` button
+4. a visible `Close` button
+5. a visible `Keep Waiting` button
+
+Only then does it invoke `Keep Waiting`.
 
 ## Repository Layout
 
@@ -134,7 +154,17 @@ Only then does it invoke `Retry`.
 - `status-ag-auto-retry.ps1` - prints current task/process/log status
 - `test-harness-ag-retry.ps1` - local popup simulator for validation
 - `config.json` - cooldown, polling, retry cap, and target settings
+- `VERSION` - current release version
+- `CHANGELOG.md` - versioned release history
 - `README.md` - project overview
+
+## Versioning
+
+This repository uses semantic version tags and GitHub Releases.
+
+- `VERSION` tracks the current packaged release version
+- `CHANGELOG.md` summarizes what changed between published versions
+- GitHub Releases provide a downloadable zip for each versioned update
 
 ## Installation
 
@@ -162,7 +192,7 @@ Once installed:
 - the watcher starts at logon
 - it stays hidden
 - it writes logs to `C:\ProgramData\AGAutoRetry\ag-auto-retry.log`
-- after clicking `Retry`, it can attempt to restore focus only when the popup itself pulled Antigravity to the foreground
+- after clicking `Retry` or `Keep Waiting`, it can attempt to restore focus only when the popup itself pulled Antigravity to the foreground
 - if the process is closed by mistake, the keepalive trigger relaunches it automatically
 
 ## Status and Diagnostics
@@ -184,12 +214,16 @@ The status script reports:
 
 ## Controlled Test Harness
 
-The repository ships with a local validation harness that simulates the target popup:
+The repository ships with a local validation harness that simulates both target popups:
 
 - `Agent terminated due to error`
 - `Dismiss`
 - `Copy debug info`
 - `Retry`
+- `The window is not responding`
+- `Reopen`
+- `Close`
+- `Keep Waiting`
 
 This allows reproducible testing without waiting for the real Antigravity failure dialog.
 
@@ -217,7 +251,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\ProgramData\AGAutoRet
 
 - Windows only
 - intentionally specific to Antigravity
-- intentionally limited to one popup signature
+- intentionally limited to two popup signatures
 - depends on Antigravity exposing the popup via UI Automation in the user session
 
 ## Not Affiliated
